@@ -275,7 +275,6 @@ def run_vineflower(vineflower_jar: Path, source_jar: Path, output_dir: Path, jav
 
     cmd = [
         java_bin,
-        "-Xmx4g",
         "-jar",
         str(vineflower_jar),
         str(source_jar),
