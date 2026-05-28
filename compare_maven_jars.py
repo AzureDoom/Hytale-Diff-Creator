@@ -38,11 +38,14 @@ class Artifact:
 
 @dataclass(frozen=True)
 class JarPair:
-    artifact: Artifact
+    previous_artifact: Artifact
+    latest_artifact: Artifact
     previous_version: str
     latest_version: str
     previous_jar: Path
     latest_jar: Path
+    previous_label: str = "previous"
+    latest_label: str = "latest"
 
 
 def normalize_url(url: str) -> str:
@@ -238,6 +241,17 @@ def pick_latest_two(artifact: Artifact) -> tuple[str, str]:
     return versions[-2], versions[-1]
 
 
+def pick_latest(artifact: Artifact) -> str:
+    """
+    Return the newest version from Maven metadata, preserving metadata order.
+    """
+    versions = [v for v in artifact.versions if v]
+    if not versions:
+        raise ValueError(f"{artifact.artifact_id} has no versions")
+
+    return versions[-1]
+
+
 def jar_url_for(artifact: Artifact, version: str) -> str:
     jar_name = f"{artifact.artifact_id}-{version}.jar"
     return urllib.parse.urljoin(artifact.base_url, f"{version}/{jar_name}")
@@ -262,11 +276,64 @@ def download_pair(artifact: Artifact, work_dir: Path) -> JarPair:
     download_file(latest_url, latest_jar)
 
     return JarPair(
-        artifact=artifact,
+        previous_artifact=artifact,
+        latest_artifact=artifact,
         previous_version=previous_version,
         latest_version=latest_version,
         previous_jar=previous_jar,
         latest_jar=latest_jar,
+        previous_label="previous",
+        latest_label="latest",
+    )
+
+
+def download_cross_patchline_pair(
+    release_artifact: Artifact,
+    pre_release_artifact: Artifact,
+    work_dir: Path,
+) -> JarPair:
+    """
+    Download the latest release-patchline JAR and the latest pre-release JAR.
+
+    This intentionally uses two separate Artifact objects because release and
+    pre-release builds live under different Maven metadata files / base URLs.
+    """
+    release_version = pick_latest(release_artifact)
+    pre_release_version = pick_latest(pre_release_artifact)
+
+    artifact_key = safe_name(
+        f"{release_artifact.group_id}.{release_artifact.artifact_id}"
+    )
+    jars_dir = work_dir / artifact_key / "jars"
+
+    release_jar = jars_dir / (
+        f"{release_artifact.artifact_id}-{release_version}-release.jar"
+    )
+    pre_release_jar = jars_dir / (
+        f"{pre_release_artifact.artifact_id}-{pre_release_version}-pre-release.jar"
+    )
+
+    release_url = jar_url_for(release_artifact, release_version)
+    pre_release_url = jar_url_for(pre_release_artifact, pre_release_version)
+
+    print(f"[download] release {release_artifact.artifact_id} {release_version}")
+    download_file(release_url, release_jar)
+
+    print(
+        f"[download] pre-release "
+        f"{pre_release_artifact.artifact_id} {pre_release_version}"
+    )
+    download_file(pre_release_url, pre_release_jar)
+
+    return JarPair(
+        previous_artifact=release_artifact,
+        latest_artifact=pre_release_artifact,
+        previous_version=release_version,
+        latest_version=pre_release_version,
+        previous_jar=release_jar,
+        latest_jar=pre_release_jar,
+        previous_label="release",
+        latest_label="pre-release",
     )
 
 
@@ -375,8 +442,14 @@ def generate_html_report(
     sections: list[str] = []
     changed_count = 0
 
-    old_label = f"{pair.artifact.artifact_id} {pair.previous_version}"
-    new_label = f"{pair.artifact.artifact_id} {pair.latest_version}"
+    old_label = (
+        f"{pair.previous_label} "
+        f"{pair.previous_artifact.artifact_id} {pair.previous_version}"
+    )
+    new_label = (
+        f"{pair.latest_label} "
+        f"{pair.latest_artifact.artifact_id} {pair.latest_version}"
+    )
 
     nav_items: list[str] = []
 
@@ -399,19 +472,46 @@ def generate_html_report(
             sections.append(section)
 
     css = """
+:root {
+  color-scheme: dark;
+  --bg: #0b1120;
+  --panel: #111827;
+  --panel-2: #1f2937;
+  --panel-3: #0f172a;
+  --text: #e5e7eb;
+  --muted: #9ca3af;
+  --border: #334155;
+  --link: #93c5fd;
+  --added-text: #86efac;
+  --removed-text: #fca5a5;
+  --changed-text: #fde68a;
+  --added-bg: rgba(34, 197, 94, 0.18);
+  --removed-bg: rgba(239, 68, 68, 0.18);
+  --changed-bg: rgba(245, 158, 11, 0.22);
+}
+* {
+  box-sizing: border-box;
+}
+html {
+  scroll-behavior: smooth;
+}
 body {
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   margin: 0;
-  background: #f7f7f8;
-  color: #1f2328;
+  background:
+    radial-gradient(circle at top left, rgba(59, 130, 246, 0.18), transparent 38rem),
+    radial-gradient(circle at bottom right, rgba(14, 165, 233, 0.12), transparent 34rem),
+    var(--bg);
+  color: var(--text);
 }
 header {
   position: sticky;
   top: 0;
   z-index: 10;
-  background: #ffffff;
-  border-bottom: 1px solid #d0d7de;
+  background: rgba(15, 23, 42, 0.94);
+  border-bottom: 1px solid var(--border);
   padding: 16px 24px;
+  backdrop-filter: blur(12px);
 }
 main {
   padding: 24px;
@@ -419,9 +519,13 @@ main {
 h1 {
   margin: 0 0 8px;
   font-size: 22px;
+  line-height: 1.25;
+}
+a {
+  color: var(--link);
 }
 .summary {
-  color: #57606a;
+  color: var(--muted);
 }
 .layout {
   display: grid;
@@ -434,9 +538,9 @@ nav {
   align-self: start;
   max-height: calc(100vh - 120px);
   overflow: auto;
-  background: #ffffff;
-  border: 1px solid #d0d7de;
-  border-radius: 10px;
+  background: rgba(17, 24, 39, 0.92);
+  border: 1px solid var(--border);
+  border-radius: 12px;
   padding: 16px;
 }
 nav ul {
@@ -447,18 +551,18 @@ nav li {
   overflow-wrap: anywhere;
 }
 .file-block {
-  background: #ffffff;
-  border: 1px solid #d0d7de;
-  border-radius: 10px;
+  background: rgba(17, 24, 39, 0.94);
+  border: 1px solid var(--border);
+  border-radius: 12px;
   margin-bottom: 24px;
   overflow: auto;
 }
 .file-block h2 {
   margin: 0;
   padding: 12px 16px;
-  border-bottom: 1px solid #d0d7de;
+  border-bottom: 1px solid var(--border);
   font-size: 15px;
-  background: #f6f8fa;
+  background: rgba(31, 41, 55, 0.85);
 }
 .status {
   display: inline-block;
@@ -466,36 +570,45 @@ nav li {
   margin-right: 8px;
   font-weight: 700;
 }
-.added .status { color: #1a7f37; }
-.removed .status { color: #cf222e; }
-.changed .status { color: #9a6700; }
+.added .status { color: var(--added-text); }
+.removed .status { color: var(--removed-text); }
+.changed .status { color: var(--changed-text); }
+.unchanged .status { color: var(--muted); }
 
 table.diff {
   width: 100%;
   border-collapse: collapse;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
+  color: var(--text);
+}
+table.diff tbody tr:hover td {
+  background-color: rgba(148, 163, 184, 0.10);
 }
 .diff_header {
-  background: #f6f8fa;
-  color: #57606a;
+  background: var(--panel-2);
+  color: var(--muted);
 }
 td {
   vertical-align: top;
   padding: 2px 6px;
   white-space: pre-wrap;
+  border-color: var(--border);
 }
 .diff_next {
   display: none;
 }
 .diff_add {
-  background: #dafbe1;
+  background: var(--added-bg);
+  color: #dcfce7;
 }
 .diff_chg {
-  background: #fff8c5;
+  background: var(--changed-bg);
+  color: #fef3c7;
 }
 .diff_sub {
-  background: #ffebe9;
+  background: var(--removed-bg);
+  color: #fee2e2;
 }
 @media (max-width: 1000px) {
   .layout {
@@ -516,14 +629,18 @@ td {
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>{html.escape(pair.artifact.artifact_id)} diff</title>
+  <title>{html.escape(pair.latest_artifact.artifact_id)} diff</title>
   <style>{css}</style>
 </head>
 <body>
   <header>
-    <h1>{html.escape(pair.artifact.group_id)}:{html.escape(pair.artifact.artifact_id)}</h1>
+    <h1>
+      {html.escape(pair.previous_artifact.group_id)}:{html.escape(pair.previous_artifact.artifact_id)}
+      →
+      {html.escape(pair.latest_artifact.group_id)}:{html.escape(pair.latest_artifact.artifact_id)}
+    </h1>
     <div class="summary">
-      Comparing {html.escape(pair.previous_version)} → {html.escape(pair.latest_version)}.
+      Comparing {html.escape(pair.previous_label)} {html.escape(pair.previous_version)} → {html.escape(pair.latest_label)} {html.escape(pair.latest_version)}.
       Changed/added/removed files: {changed_count}.
       {"Included paths: " + html.escape(", ".join(include_prefixes)) + "." if include_prefixes else "Included paths: all decompiled files."}
     </div>
@@ -600,6 +717,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Maven repository URL or direct artifact directory URL.",
     )
     parser.add_argument(
+        "--release-base-url",
+        default=None,
+        help="Direct Maven artifact directory URL for the release patchline.",
+    )
+    parser.add_argument(
+        "--pre-release-base-url",
+        default=None,
+        help="Direct Maven artifact directory URL for the pre-release patchline.",
+    )
+    parser.add_argument(
+        "--compare-release-to-pre-release",
+        action="store_true",
+        help=(
+            "Compare the latest release patchline build against the latest "
+            "pre-release build. Requires --release-base-url and "
+            "--pre-release-base-url."
+        ),
+    )
+    parser.add_argument(
         "--vineflower",
         default=Path("./vineflower.jar"),
         type=Path,
@@ -651,65 +787,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str]) -> int:
-    args = parse_args(argv)
-    args.base_url = normalize_url(args.base_url)
-    args.include_prefix = [prefix for prefix in args.include_prefix if prefix.strip()]
-
-    ensure_vineflower(args.vineflower)
-
-    work_dir = args.out / "work"
-    reports_dir = args.out / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-
-    if args.artifact_only:
-        artifacts = [load_artifact_from_direct_url(args.base_url)]
-    else:
-        print(f"[discover] crawling {args.base_url}")
-        artifacts = discover_artifacts(args.base_url)
-
-        if not artifacts:
-            print(
-                "No artifacts found by crawling. If directory listing is disabled, "
-                "rerun with --artifact-only and pass the direct artifact directory URL.",
-                file=sys.stderr,
-            )
-            return 1
-
-    if args.max_artifacts > 0:
-        artifacts = artifacts[: args.max_artifacts]
-
-    print(f"[discover] found {len(artifacts)} artifact(s)")
-
-    report_paths: list[Path] = []
-
-    for artifact in artifacts:
-        if len(artifact.versions) < 2:
-            print(f"[skip] {artifact.artifact_id}: fewer than two versions")
-            continue
-
-        try:
-            report_paths.append(process_artifact(artifact, args, work_dir, reports_dir))
-        except Exception as exc:
-            print(
-                f"[error] failed {artifact.group_id}:{artifact.artifact_id}: {exc}",
-                file=sys.stderr,
-            )
-
-    index_path = args.out / "index.html"
+def write_index(out_dir: Path, report_paths: list[Path]) -> Path:
+    index_path = out_dir / "index.html"
 
     index_css = """
     :root {
-      color-scheme: light dark;
-      --bg: #0f172a;
+      color-scheme: dark;
+      --bg: #0b1120;
       --panel: #111827;
       --panel-2: #1f2937;
       --text: #e5e7eb;
       --muted: #9ca3af;
-      --border: #374151;
+      --border: #334155;
       --accent: #60a5fa;
       --accent-2: #93c5fd;
-      --shadow: 0 20px 45px rgba(0, 0, 0, 0.25);
+      --shadow: 0 20px 45px rgba(0, 0, 0, 0.35);
     }
 
     * {
@@ -721,8 +813,8 @@ def main(argv: list[str]) -> int:
       min-height: 100vh;
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       background:
-        radial-gradient(circle at top left, rgba(96, 165, 250, 0.25), transparent 36rem),
-        radial-gradient(circle at bottom right, rgba(147, 197, 253, 0.14), transparent 32rem),
+        radial-gradient(circle at top left, rgba(96, 165, 250, 0.24), transparent 36rem),
+        radial-gradient(circle at bottom right, rgba(147, 197, 253, 0.12), transparent 32rem),
         var(--bg);
       color: var(--text);
     }
@@ -877,7 +969,7 @@ def main(argv: list[str]) -> int:
 
     report_items = "\n".join(
         f"""<li>
-          <a href="{html.escape(path.relative_to(args.out).as_posix())}">
+          <a href="{html.escape(path.relative_to(out_dir).as_posix())}">
             <span class="report-name">{html.escape(path.name)}</span>
             <span class="report-action">Open →</span>
           </a>
@@ -892,50 +984,182 @@ def main(argv: list[str]) -> int:
 
     index_path.write_text(
         f"""<!doctype html>
-    <html lang="en">
-    <head>
-      <meta charset="utf-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Maven JAR diffs</title>
-      <style>{index_css}</style>
-    </head>
-    <body>
-      <main>
-        <section class="hero">
-          <div class="eyebrow">Maven diff index</div>
-          <h1>Maven JAR diffs</h1>
-          <p class="subtitle">
-            Generated comparison reports for the latest Maven artifact versions.
-            Open a report below to review changed, added, and removed decompiled files.
-          </p>
-        </section>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Maven JAR diffs</title>
+  <style>{index_css}</style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <div class="eyebrow">Maven diff index</div>
+      <h1>Maven JAR diffs</h1>
+      <p class="subtitle">
+        Generated comparison reports for Maven artifact versions.
+        Open a report below to review changed, added, and removed decompiled files.
+      </p>
+    </section>
 
-        <section class="stats">
-          <div class="stat">
-            <strong>{len(report_paths)}</strong>
-            <span>Generated report{"s" if len(report_paths) != 1 else ""}</span>
-          </div>
-        </section>
+    <section class="stats">
+      <div class="stat">
+        <strong>{len(report_paths)}</strong>
+        <span>Generated report{"s" if len(report_paths) != 1 else ""}</span>
+      </div>
+    </section>
 
-        <section class="card">
-          <div class="card-header">
-            <h2>Reports</h2>
-            <span>{len(report_paths)} total</span>
-          </div>
-          {reports_html}
-        </section>
+    <section class="card">
+      <div class="card-header">
+        <h2>Reports</h2>
+        <span>{len(report_paths)} total</span>
+      </div>
+      {reports_html}
+    </section>
 
-        <footer>
-          Generated by compare_maven_jars.py
-        </footer>
-      </main>
-    </body>
-    </html>
-    """,
+    <footer>
+      Generated by compare_maven_jars.py
+    </footer>
+  </main>
+</body>
+</html>
+""",
         encoding="utf-8",
     )
 
     print(f"[index] {index_path}")
+    return index_path
+
+
+def process_release_to_pre_release(
+    args: argparse.Namespace,
+    work_dir: Path,
+    reports_dir: Path,
+) -> Path:
+    if not args.release_base_url or not args.pre_release_base_url:
+        raise ValueError(
+            "--compare-release-to-pre-release requires both --release-base-url "
+            "and --pre-release-base-url"
+        )
+
+    release_artifact = load_artifact_from_direct_url(
+        normalize_url(args.release_base_url)
+    )
+    pre_release_artifact = load_artifact_from_direct_url(
+        normalize_url(args.pre_release_base_url)
+    )
+
+    if release_artifact.artifact_id != pre_release_artifact.artifact_id:
+        raise ValueError(
+            "Release and pre-release artifact IDs do not match: "
+            f"{release_artifact.artifact_id} != {pre_release_artifact.artifact_id}"
+        )
+
+    pair = download_cross_patchline_pair(
+        release_artifact=release_artifact,
+        pre_release_artifact=pre_release_artifact,
+        work_dir=work_dir,
+    )
+
+    artifact_key = safe_name(
+        f"{release_artifact.group_id}.{release_artifact.artifact_id}"
+    )
+    decompiled_base = work_dir / artifact_key / "decompiled"
+
+    old_src = decompiled_base / f"release-{pair.previous_version}"
+    new_src = decompiled_base / f"pre-release-{pair.latest_version}"
+
+    if args.clean and old_src.exists():
+        shutil.rmtree(old_src)
+    if args.clean and new_src.exists():
+        shutil.rmtree(new_src)
+
+    if not old_src.exists():
+        run_vineflower(args.vineflower, pair.previous_jar, old_src, args.java)
+    else:
+        print(f"[skip] already decompiled release {pair.previous_version}")
+
+    if not new_src.exists():
+        run_vineflower(args.vineflower, pair.latest_jar, new_src, args.java)
+    else:
+        print(f"[skip] already decompiled pre-release {pair.latest_version}")
+
+    report_path = reports_dir / (
+        f"{artifact_key}-release-{pair.previous_version}"
+        f"-to-pre-release-{pair.latest_version}.html"
+    )
+
+    changed_count = generate_html_report(
+        pair=pair,
+        old_src=old_src,
+        new_src=new_src,
+        report_path=report_path,
+        include_unchanged=args.include_unchanged,
+        include_prefixes=args.include_prefix,
+    )
+
+    print(f"[report] {report_path} ({changed_count} changed/added/removed files)")
+    return report_path
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    args.base_url = normalize_url(args.base_url)
+    if args.release_base_url:
+        args.release_base_url = normalize_url(args.release_base_url)
+    if args.pre_release_base_url:
+        args.pre_release_base_url = normalize_url(args.pre_release_base_url)
+    args.include_prefix = [prefix for prefix in args.include_prefix if prefix.strip()]
+
+    ensure_vineflower(args.vineflower)
+
+    work_dir = args.out / "work"
+    reports_dir = args.out / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    report_paths: list[Path] = []
+
+    if args.compare_release_to_pre_release:
+        try:
+            report_paths.append(
+                process_release_to_pre_release(args, work_dir, reports_dir)
+            )
+        except Exception as exc:
+            print(f"[error] failed release-to-pre-release comparison: {exc}", file=sys.stderr)
+    else:
+        if args.artifact_only:
+            artifacts = [load_artifact_from_direct_url(args.base_url)]
+        else:
+            print(f"[discover] crawling {args.base_url}")
+            artifacts = discover_artifacts(args.base_url)
+
+            if not artifacts:
+                print(
+                    "No artifacts found by crawling. If directory listing is disabled, "
+                    "rerun with --artifact-only and pass the direct artifact directory URL.",
+                    file=sys.stderr,
+                )
+                return 1
+
+        if args.max_artifacts > 0:
+            artifacts = artifacts[: args.max_artifacts]
+
+        print(f"[discover] found {len(artifacts)} artifact(s)")
+
+        for artifact in artifacts:
+            if len(artifact.versions) < 2:
+                print(f"[skip] {artifact.artifact_id}: fewer than two versions")
+                continue
+
+            try:
+                report_paths.append(process_artifact(artifact, args, work_dir, reports_dir))
+            except Exception as exc:
+                print(
+                    f"[error] failed {artifact.group_id}:{artifact.artifact_id}: {exc}",
+                    file=sys.stderr,
+                )
+
+    write_index(args.out, report_paths)
     return 0 if report_paths else 1
 
 
